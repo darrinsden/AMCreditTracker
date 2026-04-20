@@ -33,6 +33,7 @@ import AVFoundation
 import BackgroundTasks
 import VisionKit
 import Vision
+import MessageUI
 
 // MARK: - App entry
 
@@ -47,7 +48,11 @@ struct AMCreditTrackerApp: App {
                 ScannedItem.self,
                 CatalogSync.self,
                 AreaManager.self,
-                AreaManagerSync.self
+                AreaManagerSync.self,
+                Store.self,
+                StoreSync.self,
+                TerritoryManager.self,
+                TerritoryManagerSync.self
             ])
             let config = ModelConfiguration(schema: schema)
             return try ModelContainer(for: schema, configurations: [config])
@@ -73,14 +78,15 @@ struct AMCreditTrackerApp: App {
     }
 
     private func syncAreaManagersOnLaunch() async {
-        // Run roster and catalog syncs in parallel. Roster blocks the UI
-        // (LaunchCoordinator waits on it). Catalog runs non-blocking —
-        // the UI loads immediately and the catalog populates when ready,
-        // which means the AM can navigate and select their identity
-        // while the product list downloads in the background.
+        // Run all four syncs in parallel. Roster blocks the UI
+        // (LaunchCoordinator waits on it). The others run non-blocking —
+        // the UI loads immediately and each table populates in the
+        // background while the AM picks their identity.
         async let roster: Void = RosterSyncCoordinator.shared.run(container: container)
         async let catalog: Void = CatalogSyncCoordinator.shared.run(container: container)
-        _ = await (roster, catalog)
+        async let stores: Void = StoreSyncCoordinator.shared.run(container: container)
+        async let tms: Void = TerritoryManagerSyncCoordinator.shared.run(container: container)
+        _ = await (roster, catalog, stores, tms)
     }
 }
 
@@ -104,7 +110,7 @@ final class RosterSyncCoordinator {
 
     // Google Drive share URL for area_managers.csv.
     // Either share link format works — the SyncService normalizes it.
-    private let sourceURL = URL(string: "https://drive.google.com/file/d/1rOFqR8IDo4lEJmT39tHtw7JsLggOauxf/view?usp=share_link")!
+    private let sourceURL = URL(string: "https://drive.google.com/file/d/1rOFqR8IDo4lEJmT39tHtw7JsLggOauxf")!
 
     private init() {}
 
@@ -143,7 +149,7 @@ final class CatalogSyncCoordinator {
 
     // Google Drive share URL for catalog.csv.
     // Either share link format works — the SyncService normalizes it.
-    private let sourceURL = URL(string: "https://drive.google.com/file/d/1izR-bDANhkOBlOyvgB9k4gCHOUSn6x5n/view?usp=share_link")!
+    private let sourceURL = URL(string: "https://drive.google.com/file/d/1izR-bDANhkOBlOyvgB9k4gCHOUSn6x5n")!
 
     private init() {}
 
@@ -162,22 +168,133 @@ final class CatalogSyncCoordinator {
     }
 }
 
+// Background stores sync. Runs at app launch alongside the roster and
+// catalog syncs. Populates the Store table, which drives the two
+// dependent pickers on the scan screen.
+@Observable
+@MainActor
+final class StoreSyncCoordinator {
+    static let shared = StoreSyncCoordinator()
+
+    enum State {
+        case idle
+        case syncing
+        case succeeded(count: Int)
+        case failed(message: String)
+    }
+
+    var state: State = .idle
+
+    // Google Drive share URL for stores.csv.
+    // Either share link format works — the SyncService normalizes it.
+    private let sourceURL = URL(string: "https://drive.google.com/file/d/1WtggB4_n1G2avUV4q0Di4VRjG2ZdrEh3")!
+
+    private init() {}
+
+    @MainActor
+    func run(container: ModelContainer) async {
+        state = .syncing
+        let service = SyncService(sourceURL: sourceURL)
+        let record = await service.syncStores(into: container)
+        let context = ModelContext(container)
+        context.insert(record)
+        try? context.save()
+        switch record.status {
+        case .success: state = .succeeded(count: record.storeCount)
+        case .failed, .partial: state = .failed(message: record.errorMessage ?? "Unknown error")
+        }
+    }
+}
+
+// Background territory-managers sync. Runs at app launch. Populates the
+// TerritoryManager table, which the submit flow uses to look up the TM's
+// email when an over-limit credit needs written approval.
+@Observable
+@MainActor
+final class TerritoryManagerSyncCoordinator {
+    static let shared = TerritoryManagerSyncCoordinator()
+
+    enum State {
+        case idle
+        case syncing
+        case succeeded(count: Int)
+        case failed(message: String)
+    }
+
+    var state: State = .idle
+
+    // Google Drive share URL for territory_managers.csv.
+    // Either share link format works — the SyncService normalizes it.
+    private let sourceURL = URL(string: "https://drive.google.com/file/d/1eJ7rQLkO9uCwATuPfPCxvSX-jIRnggss")!
+
+    private init() {}
+
+    @MainActor
+    func run(container: ModelContainer) async {
+        state = .syncing
+        let service = SyncService(sourceURL: sourceURL)
+        let record = await service.syncTerritoryManagers(into: container)
+        let context = ModelContext(container)
+        context.insert(record)
+        try? context.save()
+        switch record.status {
+        case .success: state = .succeeded(count: record.managerCount)
+        case .failed, .partial: state = .failed(message: record.errorMessage ?? "Unknown error")
+        }
+    }
+}
+
 // MARK: - Models (SwiftData)
 
 @Model
 final class Product {
-    // UPC is the natural key — indexed for fast lookup during scans.
-    @Attribute(.unique) var upc: String
+    // UPC is no longer unique — the same UPC can appear in multiple stores
+    // (e.g. Target vs. Walmart carrying the same product at different
+    // prices). The composite (upc, store) is the logical primary key,
+    // enforced at sync time by the full-replace catalog sync rather than
+    // a DB constraint.
+    var upc: String
     var name: String
     var price: Decimal
     var category: String?
+    // Store name (the retailer chain: "Target", "Walmart"). The specific
+    // store number is NOT on the product — it's on the Store entity below,
+    // which maps chains to their specific numbered locations.
+    var store: String
     var lastUpdated: Date
 
-    init(upc: String, name: String, price: Decimal, category: String? = nil, lastUpdated: Date = .now) {
+    init(upc: String,
+         name: String,
+         price: Decimal,
+         category: String? = nil,
+         store: String = "",
+         lastUpdated: Date = .now) {
         self.upc = upc
         self.name = name
         self.price = price
         self.category = category
+        self.store = store
+        self.lastUpdated = lastUpdated
+    }
+}
+
+// Store entity: maps a store name (retailer chain) to its specific
+// numbered locations. Populated from stores.csv. A single store name
+// typically has multiple store numbers (e.g. "Target" has #1842,
+// #4213, etc.). Each store is also scoped to an area so the scan
+// screen can filter the picker to only the stores the signed-in AM
+// actually covers.
+@Model
+final class Store {
+    var store: String
+    var storeNumber: String
+    var area: String
+    var lastUpdated: Date
+
+    init(store: String, storeNumber: String, area: String = "", lastUpdated: Date = .now) {
+        self.store = store
+        self.storeNumber = storeNumber
+        self.area = area
         self.lastUpdated = lastUpdated
     }
 }
@@ -189,15 +306,68 @@ final class AreaManager {
     var lastName: String
     var territory: String   // broader grouping
     var area: String        // the AM's slice within a territory
+    var email: String       // for CC on TM approval emails; empty if unknown
 
     var fullName: String { "\(firstName) \(lastName)" }
 
-    init(employeeNumber: String, firstName: String, lastName: String, territory: String, area: String) {
+    init(employeeNumber: String,
+         firstName: String,
+         lastName: String,
+         territory: String,
+         area: String,
+         email: String = "") {
         self.employeeNumber = employeeNumber
         self.firstName = firstName
         self.lastName = lastName
         self.territory = territory
         self.area = area
+        self.email = email
+    }
+}
+
+// Maps each territory to the email address of its Territory Manager.
+// Used when an AM submits an over-limit credit request that requires
+// written approval — we compose an email To: the TM for that territory,
+// CC: the submitting AM.
+@Model
+final class TerritoryManager {
+    @Attribute(.unique) var territory: String
+    var email: String
+    var lastUpdated: Date
+
+    init(territory: String, email: String, lastUpdated: Date = .now) {
+        self.territory = territory
+        self.email = email
+        self.lastUpdated = lastUpdated
+    }
+}
+
+@Model
+final class TerritoryManagerSync {
+    @Attribute(.unique) var id: UUID
+    var syncedAt: Date
+    var managerCount: Int
+    var sourceUrl: String
+    var statusRaw: String
+    var errorMessage: String?
+
+    var status: SyncStatus {
+        get { SyncStatus(rawValue: statusRaw) ?? .failed }
+        set { statusRaw = newValue.rawValue }
+    }
+
+    init(id: UUID = UUID(),
+         syncedAt: Date = .now,
+         managerCount: Int,
+         sourceUrl: String,
+         status: SyncStatus,
+         errorMessage: String? = nil) {
+        self.id = id
+        self.syncedAt = syncedAt
+        self.managerCount = managerCount
+        self.sourceUrl = sourceUrl
+        self.statusRaw = status.rawValue
+        self.errorMessage = errorMessage
     }
 }
 
@@ -354,6 +524,36 @@ final class AreaManagerSync {
     }
 }
 
+// Parallel audit record for the stores.csv sync.
+@Model
+final class StoreSync {
+    @Attribute(.unique) var id: UUID
+    var syncedAt: Date
+    var storeCount: Int
+    var sourceUrl: String
+    var statusRaw: String
+    var errorMessage: String?
+
+    var status: SyncStatus {
+        get { SyncStatus(rawValue: statusRaw) ?? .failed }
+        set { statusRaw = newValue.rawValue }
+    }
+
+    init(id: UUID = UUID(),
+         syncedAt: Date = .now,
+         storeCount: Int,
+         sourceUrl: String,
+         status: SyncStatus,
+         errorMessage: String? = nil) {
+        self.id = id
+        self.syncedAt = syncedAt
+        self.storeCount = storeCount
+        self.sourceUrl = sourceUrl
+        self.statusRaw = status.rawValue
+        self.errorMessage = errorMessage
+    }
+}
+
 // MARK: - Session store (in-memory, observable)
 
 // The active scan session lives in memory while an AM is scanning.
@@ -483,27 +683,61 @@ final class ScanSessionStore {
 
 // MARK: - Catalog service
 
-// Wraps UPC lookup. Keep this thin — SwiftData's indexed @Attribute(.unique)
-// on Product.upc is what makes lookups fast at any catalog size.
+// Wraps UPC lookup, scoped to a specific store. A single UPC may appear
+// in the catalog multiple times (once per store) with different prices
+// and metadata — the scan screen provides the store context to disambiguate.
 struct CatalogService {
     let context: ModelContext
 
-    // Looks up a UPC with format-flexibility. Tries the exact value first,
-    // then common variants: adding a leading zero (12-digit UPC-A -> 13-digit
-    // EAN-13), stripping a leading zero (13-digit -> 12-digit). This handles
-    // the fact that scanners report UPC-A barcodes as EAN-13 on some devices
-    // and as UPC-A on others, without assuming which format the catalog uses.
-    func lookup(upc: String) -> Product? {
+    // Result of a UPC lookup, distinguishing three outcomes:
+    // - .found: UPC exists in this store's catalog
+    // - .wrongStore: UPC exists in the catalog but for a different store
+    // - .notInCatalog: UPC doesn't exist anywhere in the catalog
+    enum LookupResult {
+        case found(Product)
+        case wrongStore(availableAt: [String]) // list of store names where it is stocked
+        case notInCatalog
+    }
+
+    // Store-scoped lookup. Matches UPC format-flexibly (12-digit UPC-A vs
+    // 13-digit EAN-13) AND scopes the result to a specific store (retailer
+    // chain). Returns a LookupResult so the caller can distinguish "wrong
+    // store" from "not in catalog" in UI messaging.
+    //
+    // Note: the catalog tracks products per *store* (retailer), not per
+    // *store number*. Two Target stores share the same catalog. Store
+    // number is tracked separately on the scan session for audit.
+    func lookup(upc: String, store: String) -> LookupResult {
         let candidates = upcCandidates(from: upc)
+
+        // First pass: exact store match
+        for candidate in candidates {
+            let descriptor = FetchDescriptor<Product>(
+                predicate: #Predicate {
+                    $0.upc == candidate && $0.store == store
+                }
+            )
+            if let match = try? context.fetch(descriptor).first {
+                return .found(match)
+            }
+        }
+
+        // Second pass: UPC is in catalog but for different store(s)?
+        var otherStores: [String] = []
         for candidate in candidates {
             let descriptor = FetchDescriptor<Product>(
                 predicate: #Predicate { $0.upc == candidate }
             )
-            if let match = try? context.fetch(descriptor).first {
-                return match
+            if let matches = try? context.fetch(descriptor) {
+                for m in matches {
+                    if !m.store.isEmpty && !otherStores.contains(m.store) {
+                        otherStores.append(m.store)
+                    }
+                }
             }
         }
-        return nil
+
+        return otherStores.isEmpty ? .notInCatalog : .wrongStore(availableAt: otherStores)
     }
 
     private func upcCandidates(from upc: String) -> [String] {
@@ -531,6 +765,61 @@ struct CatalogService {
     }
 }
 
+// MARK: - Store service
+
+// Wraps the Store table with helpers for the dependent pickers on the
+// scan screen: one for distinct store names (chains), and one for the
+// store numbers filtered to a specific chain. All methods accept an
+// optional area filter so the scan screen can scope results to
+// the signed-in AM's area.
+//
+// When `area` is empty string, no filtering is applied (returns
+// all stores). This handles the partial-migration case where stores.csv
+// doesn't yet have an area column.
+struct StoreService {
+    let context: ModelContext
+
+    // Distinct store names (chains), sorted alphabetically, optionally
+    // filtered to a single area.
+    func distinctStoreNames(in area: String = "") -> [String] {
+        let all = (try? context.fetch(FetchDescriptor<Store>())) ?? []
+        var seen = Set<String>()
+        var result: [String] = []
+        for s in all where !s.store.isEmpty {
+            // If an area filter is requested, only include stores
+            // that either match the area OR have no area set
+            // (partial-migration safety).
+            if !area.isEmpty && !s.area.isEmpty && s.area != area {
+                continue
+            }
+            if !seen.contains(s.store) {
+                seen.insert(s.store)
+                result.append(s.store)
+            }
+        }
+        return result.sorted()
+    }
+
+    // Store numbers assigned to a given store chain, sorted, optionally
+    // filtered to a single area.
+    func storeNumbers(for storeName: String, in area: String = "") -> [String] {
+        let descriptor = FetchDescriptor<Store>(
+            predicate: #Predicate { $0.store == storeName }
+        )
+        let matches = (try? context.fetch(descriptor)) ?? []
+        let filtered = matches.filter { s in
+            if area.isEmpty { return true }
+            if s.area.isEmpty { return true }
+            return s.area == area
+        }
+        return filtered.map { $0.storeNumber }.sorted()
+    }
+
+    func storeCount() -> Int {
+        (try? context.fetchCount(FetchDescriptor<Store>())) ?? 0
+    }
+}
+
 // MARK: - Sync service
 
 // Pulls the catalog CSV from a shared source and replaces the local
@@ -549,6 +838,8 @@ actor SyncService {
         case malformedCSV(line: Int, reason: String)
         case emptyCatalog
         case emptyRoster
+        case emptyStores
+        case emptyTerritoryManagers
     }
 
     struct ParsedProduct {
@@ -556,6 +847,7 @@ actor SyncService {
         let name: String
         let price: Decimal
         let category: String?
+        let store: String
     }
 
     let sourceURL: URL
@@ -664,12 +956,24 @@ actor SyncService {
             let name = cols[1].trimmingCharacters(in: .whitespaces)
             let priceStr = cols[2].trimmingCharacters(in: .whitespaces)
             let category = cols.count >= 4 ? cols[3].trimmingCharacters(in: .whitespaces) : nil
+            // Column 5 is the store (retailer chain). If absent (older
+            // catalog format), default to empty string — products with an
+            // empty store can only be matched when the AM's selected store
+            // is also empty, so these effectively won't scan until the
+            // catalog is re-synced with the new format.
+            let store = cols.count >= 5 ? cols[4].trimmingCharacters(in: .whitespaces) : ""
 
             let decimal = NSDecimalNumber(string: priceStr)
             guard decimal != .notANumber else {
                 throw SyncError.malformedCSV(line: idx + 1, reason: "price not a number")
             }
-            result.append(ParsedProduct(upc: upc, name: name, price: decimal as Decimal, category: category))
+            result.append(ParsedProduct(
+                upc: upc,
+                name: name,
+                price: decimal as Decimal,
+                category: category,
+                store: store
+            ))
         }
         return result
     }
@@ -682,7 +986,14 @@ actor SyncService {
         try context.delete(model: Product.self)
         let now = Date.now
         for p in parsed {
-            context.insert(Product(upc: p.upc, name: p.name, price: p.price, category: p.category, lastUpdated: now))
+            context.insert(Product(
+                upc: p.upc,
+                name: p.name,
+                price: p.price,
+                category: p.category,
+                store: p.store,
+                lastUpdated: now
+            ))
         }
         try context.save()
         return parsed.count
@@ -704,6 +1015,7 @@ actor SyncService {
         let lastName: String
         let territory: String
         let area: String
+        let email: String
     }
 
     func syncAreaManagers(into container: ModelContainer) async -> AreaManagerSync {
@@ -736,7 +1048,7 @@ actor SyncService {
             guard cols.count >= 5 else {
                 throw SyncError.malformedCSV(
                     line: idx + 1,
-                    reason: "expected 5 columns: employeeNumber, firstName, lastName, territory, area"
+                    reason: "expected at least 5 columns: employeeNumber, firstName, lastName, territory, area[, email]"
                 )
             }
             let employeeNumber = cols[0].trimmingCharacters(in: .whitespaces)
@@ -744,6 +1056,10 @@ actor SyncService {
             let lastName = cols[2].trimmingCharacters(in: .whitespaces)
             let territory = cols[3].trimmingCharacters(in: .whitespaces)
             let area = cols[4].trimmingCharacters(in: .whitespaces)
+            // Column 6 (email) is optional — older rosters without it
+            // still work; affected AMs just won't be CCd on approval
+            // emails until the column is populated.
+            let email = cols.count >= 6 ? cols[5].trimmingCharacters(in: .whitespaces) : ""
 
             guard !employeeNumber.isEmpty else {
                 throw SyncError.malformedCSV(line: idx + 1, reason: "employeeNumber is empty")
@@ -753,7 +1069,8 @@ actor SyncService {
                 firstName: firstName,
                 lastName: lastName,
                 territory: territory,
-                area: area
+                area: area,
+                email: email
             ))
         }
         return result
@@ -769,8 +1086,150 @@ actor SyncService {
                 firstName: am.firstName,
                 lastName: am.lastName,
                 territory: am.territory,
-                area: am.area
+                area: am.area,
+                email: am.email
             ))
+        }
+        try context.save()
+        return parsed.count
+    }
+
+    // MARK: Stores sync
+    //
+    // CSV format expected (first row is header):
+    //   store,storeNumber
+    //   Target,1842
+    //   Target,4213
+    //   Walmart,0051
+
+    struct ParsedStore {
+        let store: String
+        let storeNumber: String
+        let area: String
+    }
+
+    func syncStores(into container: ModelContainer) async -> StoreSync {
+        let startURL = sourceURL.absoluteString
+        do {
+            let csv = try await fetchCSV()
+            let parsed = try parseStores(csv: csv)
+            guard !parsed.isEmpty else { throw SyncError.emptyStores }
+            let count = try await applyAtomicReplaceStores(parsed: parsed, container: container)
+            return StoreSync(storeCount: count, sourceUrl: startURL, status: .success)
+        } catch {
+            return StoreSync(
+                storeCount: 0,
+                sourceUrl: startURL,
+                status: .failed,
+                errorMessage: String(describing: error)
+            )
+        }
+    }
+
+    private func parseStores(csv: String) throws -> [ParsedStore] {
+        var result: [ParsedStore] = []
+        let lines = csv.split(whereSeparator: \.isNewline)
+        guard lines.count > 1 else { throw SyncError.emptyStores }
+
+        for (idx, rawLine) in lines.enumerated() where idx > 0 {
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            if line.isEmpty { continue }
+            let cols = line.split(separator: ",", omittingEmptySubsequences: false).map { String($0) }
+            guard cols.count >= 2 else {
+                throw SyncError.malformedCSV(
+                    line: idx + 1,
+                    reason: "expected 3 columns: store, storeNumber, area"
+                )
+            }
+            let store = cols[0].trimmingCharacters(in: .whitespaces)
+            let storeNumber = cols[1].trimmingCharacters(in: .whitespaces)
+            // Area is optional for backward compatibility — stores
+            // without an area will appear to every AM regardless of
+            // the AM's area. This prevents a partial stores.csv from
+            // locking everyone out while the column is being added.
+            let area = cols.count >= 3 ? cols[2].trimmingCharacters(in: .whitespaces) : ""
+
+            guard !store.isEmpty, !storeNumber.isEmpty else {
+                throw SyncError.malformedCSV(line: idx + 1, reason: "store or storeNumber is empty")
+            }
+            result.append(ParsedStore(store: store, storeNumber: storeNumber, area: area))
+        }
+        return result
+    }
+
+    @MainActor
+    private func applyAtomicReplaceStores(parsed: [ParsedStore], container: ModelContainer) async throws -> Int {
+        let context = ModelContext(container)
+        try context.delete(model: Store.self)
+        for s in parsed {
+            context.insert(Store(store: s.store, storeNumber: s.storeNumber, area: s.area))
+        }
+        try context.save()
+        return parsed.count
+    }
+
+    // MARK: Territory managers sync
+    //
+    // CSV format expected (first row is header):
+    //   territory,email
+    //   East,east.tm@jacent.com
+    //   West,west.tm@jacent.com
+
+    struct ParsedTerritoryManager {
+        let territory: String
+        let email: String
+    }
+
+    func syncTerritoryManagers(into container: ModelContainer) async -> TerritoryManagerSync {
+        let startURL = sourceURL.absoluteString
+        do {
+            let csv = try await fetchCSV()
+            let parsed = try parseTerritoryManagers(csv: csv)
+            guard !parsed.isEmpty else { throw SyncError.emptyTerritoryManagers }
+            let count = try await applyAtomicReplaceTerritoryManagers(parsed: parsed, container: container)
+            return TerritoryManagerSync(managerCount: count, sourceUrl: startURL, status: .success)
+        } catch {
+            return TerritoryManagerSync(
+                managerCount: 0,
+                sourceUrl: startURL,
+                status: .failed,
+                errorMessage: String(describing: error)
+            )
+        }
+    }
+
+    private func parseTerritoryManagers(csv: String) throws -> [ParsedTerritoryManager] {
+        var result: [ParsedTerritoryManager] = []
+        let lines = csv.split(whereSeparator: \.isNewline)
+        guard lines.count > 1 else { throw SyncError.emptyTerritoryManagers }
+
+        for (idx, rawLine) in lines.enumerated() where idx > 0 {
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            if line.isEmpty { continue }
+            let cols = line.split(separator: ",", omittingEmptySubsequences: false).map { String($0) }
+            guard cols.count >= 2 else {
+                throw SyncError.malformedCSV(
+                    line: idx + 1,
+                    reason: "expected 2 columns: territory, email"
+                )
+            }
+            let territory = cols[0].trimmingCharacters(in: .whitespaces)
+            let email = cols[1].trimmingCharacters(in: .whitespaces)
+
+            guard !territory.isEmpty, !email.isEmpty else {
+                throw SyncError.malformedCSV(line: idx + 1, reason: "territory or email is empty")
+            }
+            result.append(ParsedTerritoryManager(territory: territory, email: email))
+        }
+        return result
+    }
+
+    @MainActor
+    private func applyAtomicReplaceTerritoryManagers(parsed: [ParsedTerritoryManager], container: ModelContainer) async throws -> Int {
+        let context = ModelContext(container)
+        try context.delete(model: TerritoryManager.self)
+        for tm in parsed {
+            context.insert(TerritoryManager(territory: tm.territory, email: tm.email))
         }
         try context.save()
         return parsed.count
@@ -1155,24 +1614,155 @@ struct ScanView: View {
     // Camera-facing state so the camera view can show a 'not found'
     // flash when a scanned UPC isn't in the catalog.
     @State private var cameraNotFoundUPC: String?
+    // Reason text accompanying cameraNotFoundUPC — distinguishes between
+    // "not in catalog" and "wrong store" cases.
+    @State private var cameraNotFoundReason: String?
 
-    // Drive the empty-catalog banner. When the catalog has zero products
-    // (fresh install, failed sync, etc.) scanning will always fail — show
-    // an explicit warning so the AM knows to sync instead of assuming
-    // every product they scan is legitimately missing.
+    // Error message shown in the manual-entry path when a scan is rejected
+    // because of store mismatch (doesn't go through the override sheet).
+    @State private var lastScanErrorMessage: String?
+
+    // Selected store and store number persist across launches. AMs
+    // typically spend a full day at one store, so remembering the last
+    // selection is a kindness. Empty strings mean "not yet selected."
+    @AppStorage("selectedStore") private var selectedStore: String = ""
+    @AppStorage("selectedStoreNumber") private var selectedStoreNumber: String = ""
+
+    // Signed-in AM's employee number. Used to scope the store picker
+    // to this AM's area (a Seattle-North AM only sees Seattle-North
+    // stores — AMs have both a broader 'territory' and a specific 'area',
+    // and stores partition by area).
+    @AppStorage("currentEmployeeNumber") private var currentEmployeeNumber: String = ""
+    @Query private var allManagers: [AreaManager]
+    @Query private var territoryManagers: [TerritoryManager]
+
+    // Resolve the signed-in AM's area, or "" if not yet signed in or
+    // not found in the roster. Empty string = no area filter, all
+    // stores visible (fail-open rather than fail-closed).
+    private var currentAMArea: String {
+        guard !currentEmployeeNumber.isEmpty else { return "" }
+        return allManagers.first { $0.employeeNumber == currentEmployeeNumber }?.area ?? ""
+    }
+
+    // The full AreaManager record for the signed-in AM.
+    private var currentAM: AreaManager? {
+        guard !currentEmployeeNumber.isEmpty else { return nil }
+        return allManagers.first { $0.employeeNumber == currentEmployeeNumber }
+    }
+
+    // AM's email for the CC line, or nil if not on file. When nil the
+    // approval email is sent without a CC.
+    private var currentAMEmail: String? {
+        guard let am = currentAM, !am.email.isEmpty else { return nil }
+        return am.email
+    }
+
+    // Territory manager email for the signed-in AM's territory, or nil
+    // if not on file. When nil the submit sheet shows an error message
+    // instead of the "open email draft" button.
+    private var territoryManagerEmail: String? {
+        guard let am = currentAM, !am.territory.isEmpty else { return nil }
+        let match = territoryManagers.first { $0.territory == am.territory }
+        guard let email = match?.email, !email.isEmpty else { return nil }
+        return email
+    }
+
+    private func buildEmailSubject() -> String {
+        let total = formatCurrencyForEmail(store.subtotal)
+        return "Credit approval request: \(selectedStore) #\(selectedStoreNumber) — \(total)"
+    }
+
+    private func buildEmailBody() -> String {
+        var lines: [String] = []
+        lines.append("Hi,")
+        lines.append("")
+        lines.append("I'm requesting written approval for a credit that exceeds the $149.99 limit.")
+        lines.append("")
+        lines.append("SESSION DETAILS")
+        lines.append("---------------")
+        if let am = currentAM {
+            lines.append("Area Manager: \(am.fullName) (#\(am.employeeNumber))")
+            lines.append("Territory: \(am.territory)")
+            lines.append("Area: \(am.area)")
+        } else {
+            lines.append("Area Manager: [unassigned]")
+        }
+        lines.append("Store: \(selectedStore)")
+        lines.append("Store number: \(selectedStoreNumber)")
+        lines.append("Date: \(formattedNow())")
+        lines.append("")
+        lines.append("LINE ITEMS")
+        lines.append("----------")
+        var running: Decimal = 0
+        for (idx, item) in store.items.enumerated() {
+            running += item.lineTotal
+            let qty = item.quantity > 1 ? "\(item.quantity) × " : ""
+            let line = "\(idx + 1). \(qty)\(item.name) @ \(formatCurrencyForEmail(item.price)) = \(formatCurrencyForEmail(item.lineTotal))   (running: \(formatCurrencyForEmail(running)))"
+            lines.append(line)
+            lines.append("   UPC: \(item.upc)")
+            if item.manualOverride {
+                lines.append("   [manual override]\(item.overrideNote.map { " — \($0)" } ?? "")")
+            }
+        }
+        lines.append("")
+        lines.append("TOTAL")
+        lines.append("-----")
+        let totalUnits = store.items.reduce(0) { $0 + $1.quantity }
+        lines.append("Items: \(store.items.count) line\(store.items.count == 1 ? "" : "s") (\(totalUnits) unit\(totalUnits == 1 ? "" : "s"))")
+        lines.append("Total: \(formatCurrencyForEmail(store.subtotal))")
+        lines.append("Limit: \(formatCurrencyForEmail(ScanSessionStore.hardLimit))")
+        lines.append("Over limit by: \(formatCurrencyForEmail(store.subtotal - ScanSessionStore.hardLimit))")
+        lines.append("")
+        lines.append("Please reply with written approval so I can proceed.")
+        lines.append("")
+        lines.append("Thanks,")
+        if let am = currentAM {
+            lines.append(am.fullName)
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    private func formatCurrencyForEmail(_ value: Decimal) -> String {
+        let f = NumberFormatter()
+        f.numberStyle = .currency
+        f.locale = Locale(identifier: "en_US")
+        return f.string(from: value as NSDecimalNumber) ?? "$\(value)"
+    }
+
+    private func formattedNow() -> String {
+        let f = DateFormatter()
+        f.dateStyle = .medium
+        f.timeStyle = .short
+        return f.string(from: .now)
+    }
+
+    // Drive the empty-catalog and empty-stores banners. When either is
+    // empty, scanning will fail — show explicit warnings so the AM knows
+    // to sync instead of assuming every product is legitimately missing.
     @Query private var products: [Product]
+    @Query private var storesData: [Store]
     @State private var catalogCoordinator = CatalogSyncCoordinator.shared
+    @State private var storeCoordinator = StoreSyncCoordinator.shared
 
     var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
+                if storesData.isEmpty {
+                    emptyStoresBanner
+                }
                 if products.isEmpty {
                     emptyCatalogBanner
                 } else if isCatalogSyncing {
                     catalogSyncingIndicator
                 }
+                if !storesData.isEmpty {
+                    storePickerBar
+                }
                 statusBar
                 scanField
+                if let msg = lastScanErrorMessage {
+                    scanErrorBanner(message: msg)
+                }
                 itemsList
                 actionBar
             }
@@ -1196,19 +1786,32 @@ struct ScanView: View {
                     }
                 }
             }
-            .onAppear { inputFocused = true }
+            .onAppear {
+                inputFocused = true
+                validateStoreSelectionForCurrentAM()
+            }
             .sheet(isPresented: $showManualOverride) {
                 ManualPriceSheet(upc: missingUPC) { override in
                     addManualItem(override)
                 }
             }
             .sheet(isPresented: $showSubmitConfirm) {
-                SubmitSheet {
+                SubmitSheet(
+                    isOverLimit: store.isOverLimit,
+                    subtotal: store.subtotal,
+                    store: selectedStore,
+                    storeNumber: selectedStoreNumber,
+                    itemCount: store.items.count,
+                    tmEmail: territoryManagerEmail,
+                    amEmail: currentAMEmail,
+                    emailSubject: buildEmailSubject(),
+                    emailBody: buildEmailBody()
+                ) {
                     submit()
                 }
             }
             .fullScreenCover(isPresented: $showCamera) {
-                CameraScannerView(notFoundUPC: cameraNotFoundUPC) { upc in
+                CameraScannerView(notFoundUPC: cameraNotFoundUPC, notFoundReason: cameraNotFoundReason) { upc in
                     return handleScan(upc)
                 }
             }
@@ -1265,6 +1868,159 @@ struct ScanView: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 6)
         .background(Color(.secondarySystemBackground))
+    }
+
+    private var isStoreSyncing: Bool {
+        if case .syncing = storeCoordinator.state { return true }
+        return false
+    }
+
+    // Shown when no Store rows exist at all. Without stores the pickers
+    // can't populate, so scanning will fail. Offer a direct sync action.
+    private var emptyStoresBanner: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+                .font(.system(size: 16))
+            VStack(alignment: .leading, spacing: 4) {
+                Text(isStoreSyncing ? "Loading stores…" : "Store list is empty")
+                    .font(.subheadline).fontWeight(.medium)
+                Text(isStoreSyncing
+                     ? "Store picker will populate when this finishes."
+                     : "You need stores before you can scan. Tap Sync to download them.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer()
+            if !isStoreSyncing {
+                Button("Sync") {
+                    Task {
+                        let container = context.container
+                        await StoreSyncCoordinator.shared.run(container: container)
+                    }
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .background(Color.orange.opacity(0.12))
+    }
+
+    // Two dependent pickers: store (retailer chain) and store number.
+    // Picking a store filters the store-number picker to just the
+    // numbered locations for that chain. Both pickers are further
+    // scoped to the signed-in AM's area so AMs only see the stores
+    // they actually cover.
+    private var storePickerBar: some View {
+        let storeService = StoreService(context: context)
+        let area = currentAMArea
+        let storeNames = storeService.distinctStoreNames(in: area)
+        let availableNumbers = selectedStore.isEmpty
+            ? []
+            : storeService.storeNumbers(for: selectedStore, in: area)
+
+        return HStack(spacing: 10) {
+            // Store name picker
+            Menu {
+                ForEach(storeNames, id: \.self) { name in
+                    Button {
+                        if selectedStore != name {
+                            selectedStore = name
+                            // Reset store number when the chain changes —
+                            // the previous number won't apply to the new
+                            // chain, and we want the AM to pick explicitly.
+                            selectedStoreNumber = ""
+                        }
+                    } label: {
+                        HStack {
+                            Text(name)
+                            if selectedStore == name {
+                                Spacer()
+                                Image(systemName: "checkmark")
+                            }
+                        }
+                    }
+                }
+            } label: {
+                HStack(spacing: 4) {
+                    Text(selectedStore.isEmpty ? "Store" : selectedStore)
+                        .fontWeight(selectedStore.isEmpty ? .regular : .medium)
+                        .foregroundStyle(selectedStore.isEmpty ? .secondary : .primary)
+                    Image(systemName: "chevron.down")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(Color(.secondarySystemBackground))
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+            }
+
+            // Store number picker, dependent on the selected store
+            Menu {
+                ForEach(availableNumbers, id: \.self) { num in
+                    Button {
+                        selectedStoreNumber = num
+                    } label: {
+                        HStack {
+                            Text(num)
+                            if selectedStoreNumber == num {
+                                Spacer()
+                                Image(systemName: "checkmark")
+                            }
+                        }
+                    }
+                }
+            } label: {
+                HStack(spacing: 4) {
+                    Text(selectedStoreNumber.isEmpty ? "Store #" : "#\(selectedStoreNumber)")
+                        .fontWeight(selectedStoreNumber.isEmpty ? .regular : .medium)
+                        .foregroundStyle(selectedStoreNumber.isEmpty ? .secondary : .primary)
+                    Image(systemName: "chevron.down")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(Color(.secondarySystemBackground))
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+            }
+            .disabled(selectedStore.isEmpty || availableNumbers.isEmpty)
+            .opacity(selectedStore.isEmpty ? 0.5 : 1.0)
+
+            Spacer()
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+    }
+
+    private func scanErrorBanner(message: String) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "exclamationmark.circle.fill")
+                .foregroundStyle(.red)
+                .font(.system(size: 14))
+            Text(message)
+                .font(.caption).foregroundStyle(.primary)
+            Spacer()
+            Button {
+                lastScanErrorMessage = nil
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
+        .background(Color.red.opacity(0.1))
+        .task(id: message) {
+            // Auto-dismiss after 4 seconds so stale messages don't linger.
+            try? await Task.sleep(for: .seconds(4))
+            if lastScanErrorMessage == message {
+                lastScanErrorMessage = nil
+            }
+        }
     }
 
     private var statusBar: some View {
@@ -1400,9 +2156,12 @@ struct ScanView: View {
                 Button("Clear") { store.clear() }
                     .buttonStyle(.bordered)
                 Spacer()
-                Button("Submit credit") { showSubmitConfirm = true }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(store.items.isEmpty || store.isOverLimit)
+                Button(store.isOverLimit ? "Request approval" : "Submit credit") {
+                    showSubmitConfirm = true
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(store.isOverLimit ? .orange : .accentColor)
+                .disabled(store.items.isEmpty)
             }
         }
         .padding()
@@ -1417,6 +2176,26 @@ struct ScanView: View {
         selectedItems.removeAll()
         withAnimation {
             editMode = .inactive
+        }
+    }
+
+    // Clear the saved store selection if the signed-in AM's area
+    // no longer includes it. Handles the "AM switched accounts" case —
+    // otherwise a Seattle-North AM signing in after a Seattle-South AM
+    // would be left with a stale Seattle-South store pre-selected.
+    private func validateStoreSelectionForCurrentAM() {
+        guard !selectedStore.isEmpty else { return }
+        let area = currentAMArea
+        let storeService = StoreService(context: context)
+        let allowedStores = storeService.distinctStoreNames(in: area)
+        if !allowedStores.contains(selectedStore) {
+            selectedStore = ""
+            selectedStoreNumber = ""
+            return
+        }
+        let allowedNumbers = storeService.storeNumbers(for: selectedStore, in: area)
+        if !selectedStoreNumber.isEmpty && !allowedNumbers.contains(selectedStoreNumber) {
+            selectedStoreNumber = ""
         }
     }
 
@@ -1439,6 +2218,21 @@ struct ScanView: View {
         }
         guard !upc.isEmpty else { return .notFound }
 
+        // Can't scan without both a store and store number selected.
+        // The catalog lookup uses the store (retailer chain); the store
+        // number is recorded on the submitted session for audit.
+        guard !selectedStore.isEmpty, !selectedStoreNumber.isEmpty else {
+            AudioService.shared.playNotFound()
+            let reason = "Select a store and store number first"
+            if showCamera {
+                cameraNotFoundUPC = upc
+                cameraNotFoundReason = reason
+            } else {
+                lastScanErrorMessage = reason
+            }
+            return .notFound
+        }
+
         // If we're in edit mode when a scan arrives, the AM has moved on
         // from editing. Exit cleanly so the new item shows in the normal
         // list view, not as an unselected row in the selection list.
@@ -1449,8 +2243,16 @@ struct ScanView: View {
             }
         }
 
+        // Propagate the current store number to the session store so
+        // that when the AM submits, the session record carries the
+        // correct store number for audit.
+        store.currentStoreNumber = selectedStoreNumber
+
         let catalog = CatalogService(context: context)
-        if let product = catalog.lookup(upc: upc) {
+        let result = catalog.lookup(upc: upc, store: selectedStore)
+
+        switch result {
+        case .found(let product):
             store.add(.init(
                 upc: product.upc,
                 name: product.name,
@@ -1460,15 +2262,30 @@ struct ScanView: View {
                 scannedAt: .now
             ))
             cameraNotFoundUPC = nil
+            cameraNotFoundReason = nil
             return .added
-        } else {
+
+        case .wrongStore(let availableAt):
+            AudioService.shared.playNotFound()
+            missingUPC = upc
+            let storesList = availableAt.joined(separator: ", ")
+            let reason = availableAt.count == 1
+                ? "Not in this store — available at \(storesList)"
+                : "Not in this store — available at: \(storesList)"
+            if showCamera {
+                cameraNotFoundUPC = upc
+                cameraNotFoundReason = reason
+            } else {
+                lastScanErrorMessage = reason
+            }
+            return .notFound
+
+        case .notInCatalog:
             AudioService.shared.playNotFound()
             missingUPC = upc
             if showCamera {
-                // Camera mode: flash the UPC in the camera UI so the AM
-                // sees the not-found. Don't open the override sheet over
-                // the camera — they can close camera and retry.
                 cameraNotFoundUPC = upc
+                cameraNotFoundReason = "Not in catalog"
             } else {
                 showManualOverride = true
             }
@@ -1490,9 +2307,10 @@ struct ScanView: View {
     private func submit() {
         let catalog = CatalogService(context: context)
         let lastSync = catalog.lastSyncedAt()
-        // Only submits that are under the limit should reach here (the
-        // button is disabled otherwise), but we re-check before writing.
-        guard !store.isOverLimit else { return }
+        // Both under-limit and over-limit submits reach here. Under-limit
+        // goes straight to audit. Over-limit arrives here only after the
+        // AM has successfully composed the approval email (the SubmitSheet
+        // gates it). The session's status will reflect which path it was.
         do {
             try store.submit(into: context, catalogSyncedAt: lastSync)
             showSubmitConfirm = false
@@ -1611,32 +2429,206 @@ struct ManualPriceSheet: View {
 // MARK: - Submit confirm sheet
 
 struct SubmitSheet: View {
+    let isOverLimit: Bool
+    let subtotal: Decimal
+    let store: String
+    let storeNumber: String
+    let itemCount: Int
+    let tmEmail: String?
+    let amEmail: String?
+    let emailSubject: String
+    let emailBody: String
     let onConfirm: () -> Void
+
     @Environment(\.dismiss) private var dismiss
+    @State private var showMailComposer = false
+    @State private var mailResult: MFMailComposeResult?
+    @State private var showNoMailAlert = false
 
     var body: some View {
         NavigationStack {
             VStack(spacing: 16) {
-                Text("Submit credit request?")
-                    .font(.title3).fontWeight(.medium)
-                Text("This will record the current session to the audit log and clear the scan list.")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-                Button("Confirm and submit") {
-                    onConfirm()
-                    dismiss()
+                if isOverLimit {
+                    overLimitBody
+                } else {
+                    normalBody
                 }
-                .buttonStyle(.borderedProminent)
             }
             .padding()
-            .navigationTitle("Submit")
+            .navigationTitle(isOverLimit ? "Approval required" : "Submit")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Cancel") { dismiss() }
                 }
             }
+            .sheet(isPresented: $showMailComposer) {
+                if let tm = tmEmail {
+                    MailComposerView(
+                        to: [tm],
+                        cc: amEmail.map { [$0] } ?? [],
+                        subject: emailSubject,
+                        body: emailBody,
+                        result: $mailResult
+                    )
+                }
+            }
+            .onChange(of: mailResult) { _, newValue in
+                guard let r = newValue else { return }
+                switch r {
+                case .sent, .saved:
+                    // Persist the session locally so we have a record
+                    // even though the final approval happens via email.
+                    onConfirm()
+                    dismiss()
+                case .cancelled, .failed:
+                    // AM cancelled or mail failed — don't persist,
+                    // let them try again.
+                    break
+                @unknown default:
+                    break
+                }
+                // Reset so a subsequent send can re-trigger onChange.
+                mailResult = nil
+            }
+            .alert("No mail account configured", isPresented: $showNoMailAlert) {
+                Button("OK") {}
+            } message: {
+                Text("Your device needs a configured mail account (Mail app) to send the approval email. Set one up in Settings → Mail.")
+            }
+        }
+    }
+
+    private var normalBody: some View {
+        VStack(spacing: 16) {
+            Text("Submit credit request?")
+                .font(.title3).fontWeight(.medium)
+            VStack(spacing: 4) {
+                Text(formatCurrency(subtotal))
+                    .font(.system(size: 34, weight: .medium))
+                Text("\(itemCount) item\(itemCount == 1 ? "" : "s") at \(store) #\(storeNumber)")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Text("This will record the session to the audit log and clear the scan list.")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+            Button("Confirm and submit") {
+                onConfirm()
+                dismiss()
+            }
+            .buttonStyle(.borderedProminent)
+            Spacer()
+        }
+    }
+
+    private var overLimitBody: some View {
+        VStack(spacing: 14) {
+            Image(systemName: "envelope.badge")
+                .font(.system(size: 42))
+                .foregroundStyle(.orange)
+            VStack(spacing: 4) {
+                Text(formatCurrency(subtotal))
+                    .font(.system(size: 34, weight: .medium))
+                    .foregroundStyle(.red)
+                Text("\(itemCount) item\(itemCount == 1 ? "" : "s") at \(store) #\(storeNumber)")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Text("This credit is over the $149.99 limit and requires written approval from the Territory Manager.")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal)
+            if let tm = tmEmail {
+                VStack(spacing: 2) {
+                    Text("The email will be sent to:")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Text(tm)
+                        .font(.caption).fontWeight(.medium)
+                    if let am = amEmail {
+                        Text("CC: \(am)")
+                            .font(.caption2).foregroundStyle(.secondary)
+                    }
+                }
+                .padding(.vertical, 8)
+                .padding(.horizontal, 14)
+                .background(Color(.secondarySystemBackground))
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+                Button {
+                    if MFMailComposeViewController.canSendMail() {
+                        showMailComposer = true
+                    } else {
+                        showNoMailAlert = true
+                    }
+                } label: {
+                    Label("Open email draft", systemImage: "envelope")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+            } else {
+                Text("No Territory Manager email on file for this territory. Contact your Area Manager or check that territory_managers.csv is synced.")
+                    .font(.caption).foregroundStyle(.red)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal)
+            }
+            Spacer()
+        }
+    }
+
+    private func formatCurrency(_ value: Decimal) -> String {
+        let f = NumberFormatter()
+        f.numberStyle = .currency
+        f.locale = Locale(identifier: "en_US")
+        return f.string(from: value as NSDecimalNumber) ?? "$\(value)"
+    }
+}
+
+// UIKit wrapper around MFMailComposeViewController so SwiftUI can present it.
+struct MailComposerView: UIViewControllerRepresentable {
+    let to: [String]
+    let cc: [String]
+    let subject: String
+    let body: String
+    @Binding var result: MFMailComposeResult?
+
+    @Environment(\.dismiss) private var dismiss
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(result: $result, dismiss: { dismiss() })
+    }
+
+    func makeUIViewController(context: Context) -> MFMailComposeViewController {
+        let vc = MFMailComposeViewController()
+        vc.mailComposeDelegate = context.coordinator
+        vc.setToRecipients(to)
+        if !cc.isEmpty { vc.setCcRecipients(cc) }
+        vc.setSubject(subject)
+        vc.setMessageBody(body, isHTML: false)
+        return vc
+    }
+
+    func updateUIViewController(_ uiViewController: MFMailComposeViewController, context: Context) {}
+
+    class Coordinator: NSObject, MFMailComposeViewControllerDelegate {
+        @Binding var result: MFMailComposeResult?
+        let dismiss: () -> Void
+
+        init(result: Binding<MFMailComposeResult?>, dismiss: @escaping () -> Void) {
+            self._result = result
+            self.dismiss = dismiss
+        }
+
+        func mailComposeController(_ controller: MFMailComposeViewController,
+                                   didFinishWith result: MFMailComposeResult,
+                                   error: Error?) {
+            if let error = error {
+                print("Mail compose error: \(error)")
+                self.result = .failed
+            } else {
+                self.result = result
+            }
+            dismiss()
         }
     }
 }
@@ -1737,6 +2729,7 @@ struct StatusPill: View {
 struct SessionDetailView: View {
     let sessionID: UUID
     @Query private var sessions: [ScanSession]
+    @Query private var allManagers: [AreaManager]
 
     init(sessionID: UUID) {
         self.sessionID = sessionID
@@ -1745,13 +2738,254 @@ struct SessionDetailView: View {
 
     var body: some View {
         if let session = sessions.first {
-            // TODO: build out the receipt view — header (date, store,
-            // AM name), flagged banner if over limit, item rows with
-            // manual-override badges, footer with catalog freshness.
-            Text("Session detail for \(session.startedAt.formatted())")
+            ScrollView {
+                VStack(spacing: 0) {
+                    headerSection(session: session)
+                    if session.status == .overLimit {
+                        overLimitBanner
+                    }
+                    lineItemsSection(session: session)
+                    totalsSection(session: session)
+                    metadataSection(session: session)
+                }
+                .padding(.bottom, 40)
+            }
+            .background(Color(.systemGroupedBackground))
+            .navigationTitle("Session detail")
+            .navigationBarTitleDisplayMode(.inline)
         } else {
-            Text("Session not found")
+            VStack(spacing: 12) {
+                Image(systemName: "exclamationmark.circle")
+                    .font(.system(size: 42))
+                    .foregroundStyle(.secondary)
+                Text("Session not found")
+                    .font(.headline)
+                Text("This session may have been deleted.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
+    }
+
+    // MARK: - Sections
+
+    private func headerSection(session: ScanSession) -> some View {
+        VStack(spacing: 10) {
+            VStack(spacing: 4) {
+                Text(formatCurrency(session.totalAmount))
+                    .font(.system(size: 38, weight: .medium))
+                    .foregroundStyle(session.status == .overLimit ? .red : .primary)
+                Text(session.submittedAt ?? session.startedAt, format: .dateTime.month(.wide).day().year().hour().minute())
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            .padding(.top, 20)
+
+            StatusPill(status: session.status)
+
+            // Store and AM attribution
+            VStack(spacing: 2) {
+                if let storeNumber = session.storeNumber, !storeNumber.isEmpty {
+                    Text("Store #\(storeNumber)")
+                        .font(.subheadline).fontWeight(.medium)
+                }
+                if let amName = amName(for: session.employeeNumber) {
+                    Text(amName)
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+                Text("Employee #\(session.employeeNumber)")
+                    .font(.caption2).foregroundStyle(.tertiary).monospaced()
+            }
+            .padding(.top, 4)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.horizontal, 20)
+        .padding(.bottom, 20)
+        .background(Color(.systemBackground))
+    }
+
+    private var overLimitBanner: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+                .font(.system(size: 16))
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Required written approval")
+                    .font(.subheadline).fontWeight(.medium)
+                Text("This session exceeded the $149.99 credit limit. Approval email sent to Territory Manager at submission time.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color.orange.opacity(0.12))
+    }
+
+    private func lineItemsSection(session: ScanSession) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text("Line items")
+                .font(.caption).fontWeight(.medium)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 20)
+                .padding(.top, 20)
+                .padding(.bottom, 8)
+
+            // Sort by scannedAt so the display order matches how the
+            // AM scanned them in the session, not the insertion order
+            // the SwiftData relationship happens to return.
+            let sorted = session.items.sorted { $0.scannedAt < $1.scannedAt }
+            VStack(spacing: 0) {
+                ForEach(Array(sorted.enumerated()), id: \.element.id) { idx, item in
+                    lineItemRow(item: item, index: idx + 1)
+                    if idx < sorted.count - 1 {
+                        Divider().padding(.leading, 20)
+                    }
+                }
+            }
+            .background(Color(.systemBackground))
+        }
+    }
+
+    private func lineItemRow(item: ScannedItem, index: Int) -> some View {
+        HStack(alignment: .top, spacing: 12) {
+            Text("\(index)")
+                .font(.caption).fontWeight(.medium)
+                .foregroundStyle(.tertiary)
+                .frame(width: 24, alignment: .trailing)
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Text(item.name)
+                        .font(.subheadline).fontWeight(.medium)
+                    if item.manualOverride {
+                        Text("manual")
+                            .font(.caption2)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color.orange.opacity(0.2))
+                            .foregroundStyle(.orange)
+                            .clipShape(Capsule())
+                    }
+                }
+                Text(item.upc)
+                    .font(.caption2).monospaced()
+                    .foregroundStyle(.tertiary)
+                if let note = item.overrideNote, !note.isEmpty {
+                    Text(note)
+                        .font(.caption).italic()
+                        .foregroundStyle(.secondary)
+                }
+                HStack(spacing: 4) {
+                    if item.quantity > 1 {
+                        Text("\(item.quantity) × \(formatCurrency(item.price))")
+                            .font(.caption).foregroundStyle(.secondary)
+                    } else {
+                        Text(formatCurrency(item.price))
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+            }
+            Spacer()
+            Text(formatCurrency(item.lineTotal))
+                .font(.subheadline).fontWeight(.medium)
+                .monospacedDigit()
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 12)
+    }
+
+    private func totalsSection(session: ScanSession) -> some View {
+        let totalUnits = session.items.reduce(0) { $0 + $1.quantity }
+        return VStack(spacing: 0) {
+            totalsRow(label: "Line items", value: "\(session.items.count)")
+            Divider().padding(.leading, 20)
+            totalsRow(label: "Total units", value: "\(totalUnits)")
+            Divider().padding(.leading, 20)
+            totalsRow(label: "Total", value: formatCurrency(session.totalAmount), emphasize: true)
+        }
+        .background(Color(.systemBackground))
+        .padding(.top, 20)
+    }
+
+    private func totalsRow(label: String, value: String, emphasize: Bool = false) -> some View {
+        HStack {
+            Text(label)
+                .font(emphasize ? .subheadline : .caption)
+                .fontWeight(emphasize ? .medium : .regular)
+                .foregroundStyle(emphasize ? .primary : .secondary)
+            Spacer()
+            Text(value)
+                .font(emphasize ? .subheadline : .caption)
+                .fontWeight(emphasize ? .medium : .regular)
+                .monospacedDigit()
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 12)
+    }
+
+    private func metadataSection(session: ScanSession) -> some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text("Audit metadata")
+                .font(.caption).fontWeight(.medium)
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 20)
+                .padding(.top, 20)
+                .padding(.bottom, 8)
+            VStack(spacing: 0) {
+                metadataRow(label: "Session ID", value: session.id.uuidString)
+                Divider().padding(.leading, 20)
+                metadataRow(
+                    label: "Scan started",
+                    value: session.startedAt.formatted(date: .abbreviated, time: .shortened)
+                )
+                if let submitted = session.submittedAt {
+                    Divider().padding(.leading, 20)
+                    metadataRow(
+                        label: "Submitted",
+                        value: submitted.formatted(date: .abbreviated, time: .shortened)
+                    )
+                }
+                if let catalogDate = session.catalogSyncedAt {
+                    Divider().padding(.leading, 20)
+                    metadataRow(
+                        label: "Catalog synced",
+                        value: catalogDate.formatted(date: .abbreviated, time: .shortened)
+                    )
+                }
+                if let notes = session.notes, !notes.isEmpty {
+                    Divider().padding(.leading, 20)
+                    metadataRow(label: "Notes", value: notes)
+                }
+            }
+            .background(Color(.systemBackground))
+        }
+    }
+
+    private func metadataRow(label: String, value: String) -> some View {
+        HStack(alignment: .top) {
+            Text(label)
+                .font(.caption).foregroundStyle(.secondary)
+                .frame(width: 110, alignment: .leading)
+            Text(value)
+                .font(.caption).monospaced()
+                .foregroundStyle(.primary)
+                .textSelection(.enabled)
+            Spacer()
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 10)
+    }
+
+    // MARK: - Helpers
+
+    private func amName(for employeeNumber: String) -> String? {
+        allManagers.first { $0.employeeNumber == employeeNumber }?.fullName
+    }
+
+    private func formatCurrency(_ value: Decimal) -> String {
+        let f = NumberFormatter()
+        f.numberStyle = .currency
+        f.locale = Locale(identifier: "en_US")
+        return f.string(from: value as NSDecimalNumber) ?? "$\(value)"
     }
 }
 
@@ -1810,7 +3044,7 @@ struct SettingsView: View {
         defer { isSyncing = false }
         // Google Drive share URL for catalog.csv.
         // Either share link format works — the SyncService normalizes it.
-        guard let url = URL(string: "https://drive.google.com/file/d/1izR-bDANhkOBlOyvgB9k4gCHOUSn6x5n/view?usp=share_link") else { return }
+        guard let url = URL(string: "https://drive.google.com/file/d/1izR-bDANhkOBlOyvgB9k4gCHOUSn6x5n") else { return }
         let service = SyncService(sourceURL: url)
         let container = context.container
         let record = await service.sync(into: container)
@@ -1854,6 +3088,7 @@ enum ScanResult {
 
 struct CameraScannerView: View {
     let notFoundUPC: String?
+    let notFoundReason: String?
     let onScan: (String) -> ScanResult
 
     @Environment(\.dismiss) private var dismiss
@@ -1903,9 +3138,16 @@ struct CameraScannerView: View {
     private var scanStatusBar: some View {
         VStack(spacing: 4) {
             if let lastScannedUPC, notFoundUPC == lastScannedUPC {
-                Text("Not in catalog: \(lastScannedUPC)")
-                    .font(.caption).monospaced()
+                // Show the specific reason (not in catalog / wrong store /
+                // no store selected) with the scanned UPC for context.
+                Text(notFoundReason ?? "Not in catalog")
+                    .font(.caption).fontWeight(.medium)
                     .foregroundStyle(.red)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal, 20)
+                Text(lastScannedUPC)
+                    .font(.caption2).monospaced()
+                    .foregroundStyle(.white.opacity(0.85))
             } else if let lastScannedUPC {
                 Text("Added: \(lastScannedUPC)")
                     .font(.caption).monospaced()
@@ -2006,7 +3248,7 @@ struct DataScannerRepresentable: UIViewControllerRepresentable {
 //       using: nil
 //   ) { task in
 //       Task {
-//           let url = URL(string: "https://drive.google.com/file/d/1izR-bDANhkOBlOyvgB9k4gCHOUSn6x5n/view?usp=share_link")!
+//           let url = URL(string: "https://drive.google.com/file/d/1izR-bDANhkOBlOyvgB9k4gCHOUSn6x5n")!
 //           let svc = SyncService(sourceURL: url)
 //           _ = await svc.sync(into: sharedContainer)
 //           task.setTaskCompleted(success: true)
