@@ -2993,6 +2993,8 @@ struct SettingsView: View {
     @Environment(\.modelContext) private var context
     @State private var isSyncing = false
     @State private var lastSyncMessage: String = ""
+    @State private var isStoreSyncing = false
+    @State private var lastStoreSyncMessage: String = ""
 
     var body: some View {
         NavigationStack {
@@ -3005,6 +3007,15 @@ struct SettingsView: View {
                     .disabled(isSyncing)
                     if !lastSyncMessage.isEmpty {
                         Text(lastSyncMessage).font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+                Section("Stores") {
+                    Button(isStoreSyncing ? "Syncing…" : "Sync now") {
+                        Task { await runStoreSync() }
+                    }
+                    .disabled(isStoreSyncing)
+                    if !lastStoreSyncMessage.isEmpty {
+                        Text(lastStoreSyncMessage).font(.caption).foregroundStyle(.secondary)
                     }
                 }
                 Section("Session") {
@@ -3054,6 +3065,23 @@ struct SettingsView: View {
             lastSyncMessage = record.status == .success
                 ? "Synced \(record.productCount) products."
                 : "Sync failed: \(record.errorMessage ?? "unknown error")"
+        }
+    }
+
+    private func runStoreSync() async {
+        isStoreSyncing = true
+        defer { isStoreSyncing = false }
+        let container = context.container
+        await StoreSyncCoordinator.shared.run(container: container)
+        await MainActor.run {
+            switch StoreSyncCoordinator.shared.state {
+            case .succeeded(let count):
+                lastStoreSyncMessage = "Synced \(count) stores."
+            case .failed(let message):
+                lastStoreSyncMessage = "Sync failed: \(message)"
+            default:
+                lastStoreSyncMessage = ""
+            }
         }
     }
 }
