@@ -1,0 +1,40 @@
+# Xcode build artifacts
+build/
+DerivedData/
+*.xcodeproj/xcuserdata/
+*.xcodeproj/project.xcworkspace/xcuserdata/
+*.xcworkspace/xcuserdata/
+
+# User-specific Xcode state (per-developer cursor positions, breakpoints, etc.)
+*.xcuserstate
+*.xcuserdatad/
+xcuserdata/
+
+# Swift Package Manager
+.build/
+.swiftpm/
+Package.resolved
+
+# macOS
+.DS_Store
+
+# CocoaPods (if added later)
+Pods/
+
+# Signing artifacts — NEVER commit
+*.p12
+*.mobileprovision
+*.cer
+*.p8
+
+# Claude Code — personal/local config
+.claude/settings.local.json
+CLAUDE.local.md
+
+# Environment / secrets
+.env
+.env.*
+secrets/
+
+# Logs
+*.log
