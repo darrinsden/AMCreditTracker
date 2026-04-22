@@ -255,12 +255,24 @@ final class Product {
     // a DB constraint.
     var upc: String
     var name: String
+    // Wholesale / credit price — the value that accumulates against
+    // the session's $149.99 limit.
     var price: Decimal
+    // Merchandising bucket. In the source CSV this column is now
+    // labeled "commodity"; the in-app field is still named `category`
+    // for back-compat with the rest of this project. The parser is
+    // positional, so the rename in the CSV header is a no-op here.
     var category: String?
     // Store name (the retailer chain: "Target", "Walmart"). The specific
     // store number is NOT on the product — it's on the Store entity below,
     // which maps chains to their specific numbered locations.
     var store: String
+    // Retail price (what the item sells for on the shelf). Optional so
+    // rows that don't yet carry it parse cleanly.
+    var retailPrice: Decimal?
+    // Merchandising rank — lower-is-better ordering hint from the
+    // catalog source. Optional because older/partial catalogs omit it.
+    var rank: Int?
     var lastUpdated: Date
 
     init(upc: String,
@@ -268,12 +280,16 @@ final class Product {
          price: Decimal,
          category: String? = nil,
          store: String = "",
+         retailPrice: Decimal? = nil,
+         rank: Int? = nil,
          lastUpdated: Date = .now) {
         self.upc = upc
         self.name = name
         self.price = price
         self.category = category
         self.store = store
+        self.retailPrice = retailPrice
+        self.rank = rank
         self.lastUpdated = lastUpdated
     }
 }
@@ -289,13 +305,30 @@ final class Store {
     var store: String
     var storeNumber: String
     var area: String
+    // Optional compact label for cramped UI surfaces (e.g. history rows,
+    // picker summaries). Empty string = no shortname set; callers should
+    // fall back to `store`. Kept in addition to `store` rather than
+    // replacing it so the canonical name stays available for emails,
+    // print headers, and CSV round-trips.
+    var shortName: String
     var lastUpdated: Date
 
-    init(store: String, storeNumber: String, area: String = "", lastUpdated: Date = .now) {
+    init(store: String,
+         storeNumber: String,
+         area: String = "",
+         shortName: String = "",
+         lastUpdated: Date = .now) {
         self.store = store
         self.storeNumber = storeNumber
         self.area = area
+        self.shortName = shortName
         self.lastUpdated = lastUpdated
+    }
+
+    /// What to show in space-constrained UI. Uses shortName when
+    /// provided, otherwise falls back to the full store name.
+    var displayName: String {
+        shortName.isEmpty ? store : shortName
     }
 }
 
@@ -827,8 +860,16 @@ struct StoreService {
 // Microsoft Graph call using MSAL — see comments at the call site.
 //
 // CSV format expected (first row is header):
-//   upc,name,price,category
-//   037000127116,Tide Pods 42ct,19.99,Laundry
+//   upc,name,price,commodity,store,retailPrice,rank
+//   037000127116,Tide Pods 42ct,19.99,Laundry,Target,24.99,1
+//
+// Columns 4 onward are optional for backward compatibility. `price`
+// is the wholesale/credit price that counts against the session limit;
+// `retailPrice` is the shelf price, displayed separately. `rank` is a
+// numeric merchandising priority (lower = more prominent). The source
+// column previously labeled "category" is now labeled "commodity"; the
+// parser is positional so either header name works, and the in-app
+// field is still named `category`.
 //
 // Prices parse as Decimal via NSDecimalNumber(string:) to avoid
 // floating-point drift.
@@ -848,6 +889,8 @@ actor SyncService {
         let price: Decimal
         let category: String?
         let store: String
+        let retailPrice: Decimal?
+        let rank: Int?
     }
 
     let sourceURL: URL
@@ -963,6 +1006,25 @@ actor SyncService {
             // catalog is re-synced with the new format.
             let store = cols.count >= 5 ? cols[4].trimmingCharacters(in: .whitespaces) : ""
 
+            // Column 6: retailPrice (shelf price). Parsed when numeric,
+            // left nil on empty/unparseable values so one bad row doesn't
+            // tank the whole sync.
+            var retailPrice: Decimal? = nil
+            if cols.count >= 6 {
+                let s = cols[5].trimmingCharacters(in: .whitespaces)
+                if !s.isEmpty {
+                    let d = NSDecimalNumber(string: s)
+                    if d != .notANumber { retailPrice = d as Decimal }
+                }
+            }
+            // Column 7: rank (merchandising priority, lower is better).
+            // Same lenient rules as retailPrice.
+            var rank: Int? = nil
+            if cols.count >= 7 {
+                let s = cols[6].trimmingCharacters(in: .whitespaces)
+                if !s.isEmpty { rank = Int(s) }
+            }
+
             let decimal = NSDecimalNumber(string: priceStr)
             guard decimal != .notANumber else {
                 throw SyncError.malformedCSV(line: idx + 1, reason: "price not a number")
@@ -972,7 +1034,9 @@ actor SyncService {
                 name: name,
                 price: decimal as Decimal,
                 category: category,
-                store: store
+                store: store,
+                retailPrice: retailPrice,
+                rank: rank
             ))
         }
         return result
@@ -992,6 +1056,8 @@ actor SyncService {
                 price: p.price,
                 category: p.category,
                 store: p.store,
+                retailPrice: p.retailPrice,
+                rank: p.rank,
                 lastUpdated: now
             ))
         }
@@ -1097,15 +1163,21 @@ actor SyncService {
     // MARK: Stores sync
     //
     // CSV format expected (first row is header):
-    //   store,storeNumber
-    //   Target,1842
-    //   Target,4213
-    //   Walmart,0051
+    //   store,storeNumber,area,shortName
+    //   Target,1842,Seattle-North,TGT
+    //   Target,4213,Seattle-North,TGT
+    //   Walmart,0051,Seattle-North,WMT
+    //
+    // Columns 3 (area) and 4 (shortName) are optional for backward
+    // compatibility — older CSVs with just `store,storeNumber` still
+    // parse cleanly. shortName, when present, is shown in compact UI
+    // (history rows, pickers) in place of the full store name.
 
     struct ParsedStore {
         let store: String
         let storeNumber: String
         let area: String
+        let shortName: String
     }
 
     func syncStores(into container: ModelContainer) async -> StoreSync {
@@ -1138,7 +1210,7 @@ actor SyncService {
             guard cols.count >= 2 else {
                 throw SyncError.malformedCSV(
                     line: idx + 1,
-                    reason: "expected 3 columns: store, storeNumber, area"
+                    reason: "expected at least 2 columns: store, storeNumber [, area, shortName]"
                 )
             }
             let store = cols[0].trimmingCharacters(in: .whitespaces)
@@ -1148,11 +1220,18 @@ actor SyncService {
             // the AM's area. This prevents a partial stores.csv from
             // locking everyone out while the column is being added.
             let area = cols.count >= 3 ? cols[2].trimmingCharacters(in: .whitespaces) : ""
+            // shortName is also optional. When present it's used in
+            // compact UI; when absent the caller falls back to the
+            // full `store` name (see Store.displayName).
+            let shortName = cols.count >= 4 ? cols[3].trimmingCharacters(in: .whitespaces) : ""
 
             guard !store.isEmpty, !storeNumber.isEmpty else {
                 throw SyncError.malformedCSV(line: idx + 1, reason: "store or storeNumber is empty")
             }
-            result.append(ParsedStore(store: store, storeNumber: storeNumber, area: area))
+            result.append(ParsedStore(store: store,
+                                      storeNumber: storeNumber,
+                                      area: area,
+                                      shortName: shortName))
         }
         return result
     }
@@ -1162,7 +1241,10 @@ actor SyncService {
         let context = ModelContext(container)
         try context.delete(model: Store.self)
         for s in parsed {
-            context.insert(Store(store: s.store, storeNumber: s.storeNumber, area: s.area))
+            context.insert(Store(store: s.store,
+                                 storeNumber: s.storeNumber,
+                                 area: s.area,
+                                 shortName: s.shortName))
         }
         try context.save()
         return parsed.count
@@ -1956,6 +2038,8 @@ struct ScanView: View {
                 .background(Color(.secondarySystemBackground))
                 .clipShape(RoundedRectangle(cornerRadius: 8))
             }
+            .disabled(!store.items.isEmpty)
+            .opacity(store.items.isEmpty ? 1.0 : 0.5)
 
             // Store number picker, dependent on the selected store
             Menu {
@@ -1986,8 +2070,8 @@ struct ScanView: View {
                 .background(Color(.secondarySystemBackground))
                 .clipShape(RoundedRectangle(cornerRadius: 8))
             }
-            .disabled(selectedStore.isEmpty || availableNumbers.isEmpty)
-            .opacity(selectedStore.isEmpty ? 0.5 : 1.0)
+            .disabled(selectedStore.isEmpty || availableNumbers.isEmpty || !store.items.isEmpty)
+            .opacity((selectedStore.isEmpty || !store.items.isEmpty) ? 0.5 : 1.0)
 
             Spacer()
         }
@@ -2637,12 +2721,27 @@ struct MailComposerView: UIViewControllerRepresentable {
 
 struct HistoryView: View {
     @Query(sort: \ScanSession.startedAt, order: .reverse) private var sessions: [ScanSession]
+    // All stores are loaded once here and passed down as a lookup map
+    // keyed by storeNumber. Avoids each HistoryRow issuing its own query.
+    @Query private var stores: [Store]
+
+    // storeNumber -> shortName label (first non-empty shortName wins).
+    // Built once per body evaluation; cheap for the roster sizes we expect.
+    private var shortNames: [String: String] {
+        var map: [String: String] = [:]
+        for s in stores where !s.shortName.isEmpty {
+            if map[s.storeNumber] == nil {
+                map[s.storeNumber] = s.shortName
+            }
+        }
+        return map
+    }
 
     var body: some View {
         NavigationStack {
             List(sessions) { session in
                 NavigationLink(value: session.id) {
-                    HistoryRow(session: session)
+                    HistoryRow(session: session, storeShortNames: shortNames)
                 }
             }
             .navigationTitle("History")
@@ -2655,6 +2754,9 @@ struct HistoryView: View {
 
 struct HistoryRow: View {
     let session: ScanSession
+    // Lookup built by HistoryView. Missing keys → no shortname available,
+    // fall back to the generic "Store #..." label.
+    let storeShortNames: [String: String]
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
@@ -2676,12 +2778,22 @@ struct HistoryRow: View {
         .padding(.vertical, 4)
     }
 
+    // Items summary includes a compact store label when the session
+    // has a storeNumber. Prefers the stores.csv `shortName` ("TGT #1842")
+    // when one is mapped, otherwise falls back to "Store #1842" so rows
+    // from older sessions or un-shortnamed stores still read cleanly.
     private var itemsSummary: String {
         let lines = session.items.count
         let units = session.items.reduce(0) { $0 + $1.quantity }
-        return lines == units
+        let base = lines == units
             ? "\(lines) items"
             : "\(lines) items · \(units) units"
+        guard let storeNumber = session.storeNumber, !storeNumber.isEmpty else {
+            return base
+        }
+        let label = storeShortNames[storeNumber].map { "\($0) #\(storeNumber)" }
+            ?? "Store #\(storeNumber)"
+        return "\(base) · \(label)"
     }
 }
 
@@ -2730,10 +2842,24 @@ struct SessionDetailView: View {
     let sessionID: UUID
     @Query private var sessions: [ScanSession]
     @Query private var allManagers: [AreaManager]
+    // Used to resolve the session's storeNumber to its retailer name
+    // (e.g. "Target #1842") for the header label. Falls back to
+    // "Store #1842" if no Store row matches the number.
+    @Query private var allStores: [Store]
 
     init(sessionID: UUID) {
         self.sessionID = sessionID
         _sessions = Query(filter: #Predicate<ScanSession> { $0.id == sessionID })
+    }
+
+    // Resolves a storeNumber to "<retailer> #<num>" using the synced
+    // stores table, or falls back to "Store #<num>" when no match exists.
+    private func storeLabel(for storeNumber: String) -> String {
+        if let match = allStores.first(where: { $0.storeNumber == storeNumber }),
+           !match.store.isEmpty {
+            return "\(match.store) #\(storeNumber)"
+        }
+        return "Store #\(storeNumber)"
     }
 
     var body: some View {
@@ -2785,7 +2911,7 @@ struct SessionDetailView: View {
             // Store and AM attribution
             VStack(spacing: 2) {
                 if let storeNumber = session.storeNumber, !storeNumber.isEmpty {
-                    Text("Store #\(storeNumber)")
+                    Text(storeLabel(for: storeNumber))
                         .font(.subheadline).fontWeight(.medium)
                 }
                 if let amName = amName(for: session.employeeNumber) {
