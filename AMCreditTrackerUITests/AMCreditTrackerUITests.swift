@@ -10,32 +10,50 @@ import XCTest
 final class AMCreditTrackerUITests: XCTestCase {
 
     override func setUpWithError() throws {
-        // Put setup code here. This method is called before the invocation of each test method in the class.
-
-        // In UI tests it is usually best to stop immediately when a failure occurs.
         continueAfterFailure = false
-
-        // In UI tests it’s important to set the initial state - such as interface orientation - required for your tests before they run. The setUp method is a good place to do this.
     }
 
-    override func tearDownWithError() throws {
-        // Put teardown code here. This method is called after the invocation of each test method in the class.
-    }
-
+    // Launch-time smoke test: the app reaches one of its known top-level
+    // screens without crashing. The exact screen depends on whether a
+    // roster is already cached and whether an AM is selected — all three
+    // states are acceptable here; we're just pinning launch behavior.
     @MainActor
-    func testExample() throws {
-        // UI tests must launch the application that they test.
+    func testAppReachesKnownTopLevelScreen() throws {
         let app = XCUIApplication()
         app.launch()
 
-        // Use XCTAssert and related functions to verify your tests produce the correct results.
-        // XCUIAutomation Documentation
-        // https://developer.apple.com/documentation/xcuiautomation
+        let loadingTitle = app.staticTexts["AM Credit Tracker"]
+        let amPickerTitle = app.navigationBars["Who's using this device?"]
+        let scanTab = app.tabBars.buttons["Scan"]
+
+        let expectation = XCTNSPredicateExpectation(
+            predicate: NSPredicate(block: { _, _ in
+                loadingTitle.exists || amPickerTitle.exists || scanTab.exists
+            }),
+            object: nil
+        )
+        wait(for: [expectation], timeout: 10)
+    }
+
+    // If the app is already past onboarding, the Scan / History / Settings
+    // tabs should be present. This is a soft check — skipped on first-run
+    // simulators that haven't synced a roster yet.
+    @MainActor
+    func testTabBarHasExpectedTabsIfPastOnboarding() throws {
+        let app = XCUIApplication()
+        app.launch()
+
+        let scanTab = app.tabBars.buttons["Scan"]
+        guard scanTab.waitForExistence(timeout: 5) else {
+            throw XCTSkip("App is on onboarding — tab bar not present.")
+        }
+
+        XCTAssertTrue(app.tabBars.buttons["History"].exists)
+        XCTAssertTrue(app.tabBars.buttons["Settings"].exists)
     }
 
     @MainActor
     func testLaunchPerformance() throws {
-        // This measures how long it takes to launch your application.
         measure(metrics: [XCTApplicationLaunchMetric()]) {
             XCUIApplication().launch()
         }
